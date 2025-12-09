@@ -1,63 +1,72 @@
 import axios from 'axios';
-import * as cheerio from 'cheerio';
 
 export default async function handler(req, res) {
-  // Hanya menerima method POST
   if (req.method !== 'POST') {
-    return res.status(405).json({ message: 'Method not allowed' });
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   const { url } = req.body;
 
-  if (!url || !url.includes('dailymotion.com')) {
-    return res.status(400).json({ error: 'Masukkan URL Dailymotion yang valid' });
-  }
-
   try {
-    // 1. SETTING PENYAMARAN (USER AGENT)
-    // Kita menyamar sebagai Chrome di Windows agar tidak diblokir
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://www.dailymotion.com/',
-    };
+    // 1. Validasi & Ambil ID Video
+    // Menerima format: dailymotion.com/video/x8hsr3c atau dai.ly/x8hsr3c
+    const videoIdMatch = url.match(/video\/([a-zA-Z0-9]+)|dai\.ly\/([a-zA-Z0-9]+)/);
+    const videoId = videoIdMatch ? (videoIdMatch[1] || videoIdMatch[2]) : null;
 
-    // 2. Request ke Dailymotion
-    const { data } = await axios.get(url, { headers });
+    if (!videoId) {
+      return res.status(400).json({ error: 'Link tidak valid. Pastikan link Dailymotion benar.' });
+    }
+
+    // 2. Trik Jitu: Gunakan API Publik Dailymotion (Lebih Resmi & Stabil)
+    // Kita minta data metadata dasar dulu (Judul, Thumbnail)
+    const metadataUrl = `https://api.dailymotion.com/video/${videoId}?fields=id,title,thumbnail_1080_url,owner.username,duration`;
     
-    // 3. Membedah HTML dengan Cheerio
-    const $ = cheerio.load(data);
+    const { data: meta } = await axios.get(metadataUrl).catch(() => ({ data: null }));
     
-    // Strategi: Mencari metadata Schema.org (JSON-LD) yang biasanya berisi link file
-    // Dailymotion biasanya menaruh link .m3u8 (HLS) di sini
-    let videoData = null;
-    
-    $('script[type="application/ld+json"]').each((i, el) => {
-      try {
-        const json = JSON.parse($(el).html());
-        if (json['@type'] === 'VideoObject') {
-          videoData = json;
-        }
-      } catch (e) {
-        // ignore parsing error
+    if (!meta) {
+      throw new Error('Video tidak ditemukan atau bersifat Pribadi.');
+    }
+
+    // 3. Ambil Link Stream (m3u8) dari Halaman Embed
+    // Halaman embed pasti punya link m3u8 untuk player
+    const embedUrl = `https://www.dailymotion.com/embed/video/${videoId}`;
+    const { data: html } = await axios.get(embedUrl, {
+      headers: {
+        // Pura-pura jadi browser asli agar tidak diblokir
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.dailymotion.com/',
       }
     });
 
-    if (!videoData) {
-      throw new Error('Video tidak ditemukan atau diproteksi');
+    // 4. Mencari Link "Master m3u8" dengan Regex
+    // Link ini biasanya tersembunyi di dalam teks konfigurasi player
+    // Formatnya: "url":"https://...manifest.m3u8..."
+    const m3u8Match = html.match(/"url":"([^"]+\.m3u8[^"]*)"/);
+
+    if (!m3u8Match) {
+      // Jika gagal regex pertama, coba regex cadangan (format decoded)
+      const m3u8Backup = html.match(/src":"([^"]+\.m3u8[^"]*)"/);
+      if (!m3u8Backup) throw new Error('Link download terproteksi. Coba video lain.');
+      
+      var streamUrl = m3u8Backup[1].replace(/\\/g, ''); // Bersihkan karakter escape
+    } else {
+      var streamUrl = m3u8Match[1].replace(/\\/g, '');
     }
 
-    // 4. Kirim Hasil ke Frontend
-    // contentUrl biasanya berisi link stream .m3u8
+    // 5. Sukses! Kirim data ke Frontend
     res.status(200).json({
-      title: videoData.name,
-      thumbnail: videoData.thumbnailUrl,
-      downloadUrl: videoData.contentUrl, // Link .m3u8 (Master Playlist)
-      description: videoData.description
+      title: meta.title,
+      thumbnail: meta.thumbnail_1080_url,
+      duration: meta.duration,
+      author: meta['owner.username'],
+      downloadUrl: streamUrl, // Link Master M3U8 (All Qualities)
+      quality: 'Auto (HLS)'
     });
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Gagal mengambil data. Pastikan link publik.' });
+    console.error('Error:', error.message);
+    res.status(500).json({ 
+      error: error.message || 'Gagal mengambil data. Server Dailymotion menolak akses.' 
+    });
   }
 }
